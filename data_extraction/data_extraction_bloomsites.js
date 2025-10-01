@@ -121,7 +121,6 @@ var siteSummary = bloomSites.map(function(site) {
 });
 
 // exporting all
-// Export 1: Full time series data
 Export.table.toDrive({
   collection: timeSeries,
   description: 'bloomwatch_full_timeseries_2020_2025',
@@ -130,7 +129,6 @@ Export.table.toDrive({
   selectors: ['id', 'Site', 'Type', 'date', 'year', 'NDVI', 'NDWI', 'cloud_cover']
 });
 
-// Export 2: Site summaries
 Export.table.toDrive({
   collection: siteSummary,
   description: 'bloomwatch_site_summaries_2020_2025',
