@@ -50,9 +50,9 @@ async def lifespan(app: FastAPI):
     global ML_MODEL, SCALER, FEATURE_COLUMNS
     
     try:
-        ML_MODEL = joblib.load('C:/Users/User/Desktop/nasashit/BloomAI/App/bloom_detection_model_fixed.joblib')
-        SCALER = joblib.load('C:/Users/User/Desktop/nasashit/BloomAI/App/feature_scaler_fixed.joblib')
-        FEATURE_COLUMNS = joblib.load('C:/Users/User/Desktop/nasashit/BloomAI/App/feature_columns_fixed.joblib')
+        ML_MODEL = joblib.load('C:/Users/User/Desktop/nasashit/BloomAI/App/mil_bloom_model.joblib')
+        SCALER = joblib.load('C:/Users/User/Desktop/nasashit/BloomAI/App/mil_features.joblib')
+        FEATURE_COLUMNS = joblib.load('C:/Users/User/Desktop/nasashit/BloomAI/App/mil_scaler.joblib')
         print("✅ ML Model loaded successfully")
     except Exception as e:
         print(f"❌ Failed to load ML model: {e}")
