@@ -46,14 +46,15 @@ FEATURE_COLUMNS = None
 
 @asynccontextmanager
 async def lifespan(app: FastAPI):
-    # Startup: Load ML model and initialize Earth Engine
+    # Startup: Load MIL model and initialize Earth Engine
     global ML_MODEL, SCALER, FEATURE_COLUMNS
     
     try:
         ML_MODEL = joblib.load('C:/Users/User/Desktop/nasashit/BloomAI/App/mil_bloom_model.joblib')
-        SCALER = joblib.load('C:/Users/User/Desktop/nasashit/BloomAI/App/mil_features.joblib')
-        FEATURE_COLUMNS = joblib.load('C:/Users/User/Desktop/nasashit/BloomAI/App/mil_scaler.joblib')
-        print("✅ ML Model loaded successfully")
+        SCALER = joblib.load('C:/Users/User/Desktop/nasashit/BloomAI/App/mil_scaler.joblib')
+        FEATURE_COLUMNS = joblib.load('C:/Users/User/Desktop/nasashit/BloomAI/App/mil_features.joblib')
+        print("✅ MIL Model loaded successfully")
+        print(f"✅ Features: {FEATURE_COLUMNS}")
     except Exception as e:
         print(f"❌ Failed to load ML model: {e}")
         ML_MODEL = None
@@ -70,8 +71,8 @@ async def lifespan(app: FastAPI):
 # Create FastAPI app with lifespan
 app = FastAPI(
     title="Bloom Prediction API",
-    description="Predict wildflower bloom probability using satellite data and machine learning",
-    version="1.0.0",
+    description="Predict wildflower bloom probability using satellite data and MIL model",
+    version="2.0.0",
     lifespan=lifespan
 )
 
@@ -87,7 +88,7 @@ def initialize_earth_engine():
 
 def get_essential_vegetation_data(lat, lon, target_date, buffer_meters=200, max_days_back=30):
     """
-    Get essential vegetation data optimized for ML bloom prediction
+    Get essential vegetation data optimized for MIL bloom prediction
     """
     point = ee.Geometry.Point([lon, lat])
     area = point.buffer(buffer_meters)
@@ -109,10 +110,6 @@ def get_essential_vegetation_data(lat, lon, target_date, buffer_meters=200, max_
     
     if not satellite_data:
         return None
-    
-    # Add location to features
-    satellite_data['longitude'] = lon
-    satellite_data['latitude'] = lat
     
     return satellite_data
 
@@ -138,7 +135,7 @@ def get_satellite_data_with_fallback(lat, lon, target_dt, satellite, buffer_mete
     return None
 
 def get_single_date_satellite_data(lat, lon, date, satellite, buffer_meters, area):
-    """Get vegetation data for a single date and satellite"""
+    """Get vegetation data for a single date and satellite - NOW WITH EVI AND LST"""
     
     collection_id = 'LANDSAT/LC09/C02/T1_L2' if satellite == 'Landsat-9' else 'LANDSAT/LC08/C02/T1_L2'
     
@@ -162,12 +159,31 @@ def get_single_date_satellite_data(lat, lon, date, satellite, buffer_meters, are
             print(f"   Skipping {date}: High cloud cover ({cloud_cover}%)")
             return None
         
-        # Calculate essential indices only
+        # Calculate ALL essential indices for MIL model
         ndvi = image.normalizedDifference(['SR_B5', 'SR_B4']).rename('NDVI')
         ndwi = image.normalizedDifference(['SR_B3', 'SR_B5']).rename('NDWI')
-        composite = ndvi.addBands(ndwi)
         
-        # Single efficient API call for both indices
+        # Enhanced Vegetation Index (EVI) - important for MIL model
+        evi = image.expression(
+            '2.5 * ((NIR - RED) / (NIR + 6 * RED - 7.5 * BLUE + 1))',
+            {
+                'NIR': image.select('SR_B5'),
+                'RED': image.select('SR_B4'),
+                'BLUE': image.select('SR_B2')
+            }
+        ).rename('EVI')
+        
+        # Land Surface Temperature (LST) - important for MIL model
+        lst = image.select('ST_B10')\
+            .multiply(0.00341802)\
+            .add(149.0)\
+            .subtract(273.15)\
+            .rename('LST')
+        
+        # Combine all bands for single API call
+        composite = ndvi.addBands(ndwi).addBands(evi).addBands(lst)
+        
+        # Single efficient API call for all indices
         area_stats = composite.reduceRegion(
             reducer=ee.Reducer.mean(),
             geometry=area,
@@ -178,14 +194,25 @@ def get_single_date_satellite_data(lat, lon, date, satellite, buffer_meters, are
         
         ndvi_val = area_stats.get('NDVI')
         ndwi_val = area_stats.get('NDWI')
+        evi_val = area_stats.get('EVI')
+        lst_val = area_stats.get('LST')
         
         if ndvi_val is None:
             return None
         
+        # Get month and day_of_year for MIL model features
+        current_dt = datetime.strptime(date, '%Y-%m-%d')
+        month = current_dt.month
+        day_of_year = current_dt.timetuple().tm_yday
+        
         return {
             'ndvi': float(ndvi_val),
             'ndwi': float(ndwi_val),
+            'evi': float(evi_val),
+            'lst': float(lst_val),
             'cloud_cover': float(cloud_cover),
+            'month': month,
+            'day_of_year': day_of_year,
             'satellite': satellite,
             'date': date,
             'buffer_size': buffer_meters
@@ -197,122 +224,187 @@ def get_single_date_satellite_data(lat, lon, date, satellite, buffer_meters, are
 
 def predict_bloom_with_ml(features_dict):
     """
-    FIXED ML prediction function with better error handling
+    FINAL TWEAK: Better balance for bloom sites while keeping non-bloom protection
     """
+    # Extract key features
+    ndvi = features_dict['ndvi']
+    evi = features_dict['evi']
+    ndwi = features_dict['ndwi']
+    lst = features_dict['lst']
+    month = features_dict['month']
+
+    if month in [11, 12, 1, 2]:  # Winter months
+        if evi < 0.8 and ndvi < 0.3:  # Not extremely high vegetation
+            print("❄️  WINTER ADJUSTMENT: Reducing probability for winter season")
+            # We'll apply this adjustment later after ML prediction
     
-    # if ML_MODEL is None:
-    #     print("⚠️ ML model not loaded, using fallback heuristic")
-    #     return predict_bloom_fallback(features_dict)
+    # ONLY override for clearly impossible conditions
+    if ndvi < 0.05:  # Bare ground/water
+        print("⚠️  OVERRIDE: Extremely low NDVI - forcing NO_BLOOM")
+        return {
+            'bloom_probability': 8.0,
+            'prediction': 'NO_BLOOM',
+            'confidence': 'HIGH'
+        }
     
-    # try:
-    #     # DEBUG: Check what we're feeding the model
-    #     print(f"🔍 ML Input Debug:")
-    #     print(f"   NDVI: {features_dict['ndvi']} (type: {type(features_dict['ndvi'])})")
-    #     print(f"   NDWI: {features_dict['ndwi']} (type: {type(features_dict['ndwi'])})")
-    #     print(f"   Cloud Cover: {features_dict['cloud_cover']} (type: {type(features_dict['cloud_cover'])})")
-    #     print(f"   Latitude: {features_dict['latitude']} (type: {type(features_dict['latitude'])})")
-        
-    #     # Create numpy array with explicit dtype
-    #     features_array = np.array([[
-    #         float(features_dict['ndvi']),
-    #         float(features_dict['ndwi']),
-    #         float(features_dict['cloud_cover']),
-    #         float(features_dict['latitude'])
-    #     ]], dtype=np.float64)
-        
-    #     print(f"   Features array: {features_array}")
-    #     print(f"   Array shape: {features_array.shape}")
-    #     print(f"   Array dtype: {features_array.dtype}")
-        
-    #     # Check scaler stats
-    #     print(f"   Scaler mean: {SCALER.mean_ if hasattr(SCALER, 'mean_') else 'N/A'}")
-    #     print(f"   Scaler scale: {SCALER.scale_ if hasattr(SCALER, 'scale_') else 'N/A'}")
-        
-    #     # Scale features
-    #     features_scaled = SCALER.transform(features_array)
-    #     print(f"   Scaled features: {features_scaled}")
-        
-    #     # Get prediction probabilities
-    #     probabilities = ML_MODEL.predict_proba(features_scaled)
-    #     print(f"   Raw probabilities: {probabilities}")
-        
-    #     # Handle different model output formats
-    #     if probabilities.shape[1] == 2:  # Binary classification
-    #         bloom_probability = probabilities[0, 1]  # Probability of class 1 (bloom)
-    #     else:
-    #         bloom_probability = probabilities[0, 0]  # Single class or different format
-        
-    #     prediction = ML_MODEL.predict(features_scaled)[0]
-        
-    #     print(f"   Final bloom probability: {bloom_probability:.4f} ({bloom_probability*100:.2f}%)")
-    #     print(f"   Prediction class: {prediction}")
-        
-    #     # Determine confidence
-    #     if bloom_probability > 0.75 or bloom_probability < 0.25:
-    #         confidence = 'high'
-    #     elif bloom_probability > 0.55 or bloom_probability < 0.45:
-    #         confidence = 'medium'
-    #     else:
-    #         confidence = 'low'
-        
-    #     return {
-    #         'bloom_probability': round(float(bloom_probability * 100), 2),
-    #         'prediction': 'BLOOM' if prediction == 1 else 'NO_BLOOM',
-    #         'confidence': confidence,
-    #     }
-        
-    # except Exception as e:
-    #     print(f"❌ ML prediction error: {e}")
-    #     import traceback
-    #     traceback.print_exc()
-    #     return predict_bloom_fallback(features_dict)
-    return predict_bloom_fallback(features_dict) 
+    if evi < 0.1 and ndvi < 0.1:  # Both indices extremely low
+        print("⚠️  OVERRIDE: Extremely low vegetation - forcing NO_BLOOM")
+        return {
+            'bloom_probability': 10.0,
+            'prediction': 'NO_BLOOM', 
+            'confidence': 'HIGH'
+        }
+    
+    # Only use ML model if not in extreme cases
+    if ML_MODEL is not None:
+        try:
+            features_array = np.array([[
+                float(features_dict['ndvi']),
+                float(features_dict['ndwi']), 
+                float(features_dict['evi']),
+                float(features_dict['lst']),
+                float(features_dict['cloud_cover']),
+                float(features_dict['month']),
+                float(features_dict['day_of_year'])
+            ]], dtype=np.float64)
+            
+            features_scaled = SCALER.transform(features_array)
+            probabilities = ML_MODEL.predict_proba(features_scaled)
+            
+            if probabilities.shape[1] == 2:
+                bloom_probability = probabilities[0, 1]
+            else:
+                bloom_probability = probabilities[0, 0]
+            
+            prediction = ML_MODEL.predict(features_scaled)[0]
+
+            if month in [11, 12, 1, 2] and evi < 0.8 and ndvi < 0.3:
+                winter_factor = 0.5  # Reduce probability by 50% in winter
+                bloom_probability = bloom_probability * winter_factor
+                print(f"❄️  Applied winter adjustment (factor: {winter_factor})")
+            
+            # IMPROVED ADJUSTMENT: Be more generous for bloom sites with decent EVI
+            if bloom_probability > 0.8:
+                if evi > 0.5:  # Good EVI - less penalty
+                    adjustment_factor = min(1.0, max(0.7, ndvi / 0.25))  # Minimum 0.7 factor if EVI is good
+                    bloom_probability = bloom_probability * adjustment_factor
+                    print(f"⚠️  LIGHT ADJUSTMENT: Good EVI, reduced penalty (factor: {adjustment_factor:.2f})")
+                elif ndvi < 0.25:  # Moderate NDVI - moderate penalty
+                    adjustment_factor = min(1.0, ndvi / 0.3)
+                    bloom_probability = bloom_probability * adjustment_factor
+                    print(f"⚠️  ADJUSTED: Scaled high probability due to moderate vegetation (factor: {adjustment_factor:.2f})")
+            
+            # ENHANCED Seasonal confidence boost for spring months
+            if month in [3, 4, 5] and bloom_probability > 0.3:
+                # More generous boost for spring when blooms are more likely
+                boost_factor = 1.15 if evi > 0.4 else 1.05
+                bloom_probability = min(0.95, bloom_probability * boost_factor)
+                print(f"✅ Seasonal boost applied for spring months (factor: {boost_factor})")
+            
+            # BETTER Confidence calculation
+            if bloom_probability > 0.75 or bloom_probability < 0.25:
+                confidence = 'HIGH'
+            elif bloom_probability > 0.6 or bloom_probability < 0.4:
+                confidence = 'MEDIUM'
+            else:
+                confidence = 'LOW'
+            
+            return {
+                'bloom_probability': round(float(bloom_probability * 100), 2),
+                'prediction': 'BLOOM' if prediction == 1 else 'NO_BLOOM',
+                'confidence': confidence,
+            }
+            
+        except Exception as e:
+            print(f"❌ ML prediction error: {e}")
+    
+    # Enhanced fallback
+    return predict_bloom_fallback(features_dict)
 
 def predict_bloom_fallback(features_dict):
-    """Fallback heuristic if ML model fails"""
+    """Optimized fallback heuristic for better bloom site detection"""
     ndvi = features_dict['ndvi']
     ndwi = features_dict['ndwi']
+    evi = features_dict['evi']
+    lst = features_dict['lst']
+    month = features_dict['month']
     
     score = 0.0
     
-    if ndvi > 0.6:
-        score += 60
-    elif ndvi > 0.4:
-        score += 40
-    elif ndvi > 0.2:
-        score += 20
+    # IMPROVED: More emphasis on EVI for bloom sites
+    if evi > 0.7:
+        score += 55  # Increased from 50
+    elif evi > 0.5:
+        score += 40  # Increased from 35
+    elif evi > 0.3:
+        score += 25  # Increased from 20
+    elif evi > 0.15:
+        score += 8   # Increased from 5
     
-    if -0.3 < ndwi < 0.1:
-        score += 20
-    elif -0.5 < ndwi < 0.3:
-        score += 10
+    # IMPROVED: Better NDVI scoring
+    if ndvi > 0.5:
+        score += 30  # Increased from 25
+    elif ndvi > 0.3:
+        score += 20  # Increased from 15
+    elif ndvi > 0.15:
+        score += 8   # Increased from 5
     
-    probability = min(95, max(5, score))
+    # IMPROVED: Environmental factors with better thresholds
+    if -0.2 < ndwi < 0.05:
+        score += 15
+    
+    # Better temperature range for blooms
+    if 12 < lst < 32:  # Wider optimal range
+        score += 12
+    elif 8 < lst < 38:  # Extended acceptable range
+        score += 5
+    
+    # IMPROVED: Stronger seasonal adjustment for spring
+    if month in [3, 4, 5]:  # Spring
+        score += 15  # Increased from 10
+    elif month in [11, 12, 1, 2]:  # Winter
+        score -= 3   # Reduced from 5 (less penalty)
+    
+    # Cap the probability
+    probability = min(90, max(8, score))
+    
+    # IMPROVED: More nuanced prediction thresholds
+    if probability > 52:  # Lowered from 55
+        prediction = 'BLOOM'
+        confidence = 'MEDIUM' if probability > 65 else 'LOW'
+    else:
+        prediction = 'NO_BLOOM' 
+        confidence = 'MEDIUM' if probability < 25 else 'LOW'
     
     return {
         'bloom_probability': round(probability, 2),
-        'prediction': 'BLOOM' if probability > 50 else 'NO_BLOOM',
-        'confidence': 'low'
+        'prediction': prediction,
+        'confidence': confidence
     }
 
 # FastAPI Routes
 @app.get("/")
 async def root():
     return {
-        "message": "Bloom Prediction API",
+        "message": "Bloom Prediction API with MIL Model",
         "status": "active",
         "model_loaded": ML_MODEL is not None,
-        "earth_engine": "initialized"
+        "model_type": "MIL (Multiple Instance Learning)",
+        "features": FEATURE_COLUMNS if FEATURE_COLUMNS else "Not loaded"
     }
 
 @app.get("/health")
 async def health_check():
-    return {"status": "healthy", "model_loaded": ML_MODEL is not None}
+    return {
+        "status": "healthy", 
+        "model_loaded": ML_MODEL is not None,
+        "earth_engine": "initialized"
+    }
 
 @app.post("/predict", response_model=BloomPredictionResponse)
 async def predict_bloom(request: BloomPredictionRequest):
     """
-    Predict bloom probability for a given location and date
+    Predict bloom probability for a given location and date using MIL model
     
     - **lat**: Latitude (-90 to 90)
     - **lon**: Longitude (-180 to 180)  
@@ -320,7 +412,7 @@ async def predict_bloom(request: BloomPredictionRequest):
     """
     start_time = time.time()
     
-    print(f"🌼 API Request: ({request.lat}, {request.lon}) on {request.date}")
+    print(f"🌼 MIL API Request: ({request.lat}, {request.lon}) on {request.date}")
     
     # Validate date format
     try:
@@ -328,7 +420,7 @@ async def predict_bloom(request: BloomPredictionRequest):
     except ValueError:
         raise HTTPException(status_code=400, detail="Invalid date format. Use YYYY-MM-DD")
     
-    # Get satellite data
+    # Get satellite data with ALL features needed for MIL model
     satellite_data = get_essential_vegetation_data(request.lat, request.lon, request.date)
     
     if not satellite_data:
@@ -337,20 +429,25 @@ async def predict_bloom(request: BloomPredictionRequest):
             detail="No satellite data available for this location and time period (within 30 days)"
         )
     
-    # Use ML model to predict bloom probability
+    # Use MIL model to predict bloom probability
     ml_prediction = predict_bloom_with_ml(satellite_data)
     
     # Build response
     prob = ml_prediction['bloom_probability']
-    if prob > 70:
-        message = '🌸 High likelihood of wildflower blooms!'
-        recommendation = 'Great time to visit for wildflower viewing'
+    
+    # Enhanced messaging based on MIL model confidence
+    if prob > 80:
+        message = '🌸 HIGH BLOOM PROBABILITY - Excellent conditions detected!'
+        recommendation = 'Prime time for wildflower viewing based on vegetation patterns'
+    elif prob > 60:
+        message = '🌼 MODERATE BLOOM PROBABILITY - Good conditions'
+        recommendation = 'Likely blooms present, good time to visit'
     elif prob > 40:
-        message = '🌼 Moderate chance of wildflower blooms'
-        recommendation = 'Blooms may be present but not peak conditions'
+        message = '🌱 UNCERTAIN BLOOM PROBABILITY - Mixed signals'
+        recommendation = 'Some vegetation activity detected, but not peak conditions'
     else:
-        message = '🍂 Low probability of blooms at this time'
-        recommendation = 'Check back during peak bloom season (typically spring)'
+        message = '🍂 LOW BLOOM PROBABILITY - Minimal activity'
+        recommendation = 'Check back during optimal seasonal periods'
     
     response = {
         'success': True,
@@ -369,12 +466,9 @@ async def predict_bloom(request: BloomPredictionRequest):
         'vegetation_indices': {
             'ndvi': round(satellite_data['ndvi'], 4),
             'ndwi': round(satellite_data['ndwi'], 4),
-            'ndvi_interpretation': (
-                'High vegetation (bloom-like)' if satellite_data['ndvi'] > 0.6 
-                else 'Moderate vegetation' if satellite_data['ndvi'] > 0.3 
-                else 'Low vegetation (no bloom)' if satellite_data['ndvi'] > 0
-                else 'Bare ground/water'
-            )
+            'evi': round(satellite_data['evi'], 4),  # NEW: EVI for MIL model
+            'lst': round(satellite_data['lst'], 2),   # NEW: LST for MIL model
+            'mil_model_features': FEATURE_COLUMNS if FEATURE_COLUMNS else []
         },
         'location': {
             'latitude': request.lat,
@@ -384,10 +478,10 @@ async def predict_bloom(request: BloomPredictionRequest):
         'recommendation': recommendation
     }
     
-    print(f"✅ API Response: {prob}% bloom probability")
+    print(f"✅ MIL API Response: {prob}% bloom probability ({ml_prediction['confidence']} confidence)")
     return response
 
 # Run the application
 if __name__ == "__main__":
     import uvicorn
-    uvicorn.run(app, host="0.0.0.0", port=8000)
+    uvicorn.run(app, host="0.0.0.0", port=8080)
